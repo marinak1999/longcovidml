@@ -1,0 +1,282 @@
+---
+title: "Final"
+output: pdf_document
+date: "2024-11-09"
+---
+# Set Up
+```{r Setting up Knitr, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, tidy.opts = list(width.cutoff = 60), tidy = TRUE) 
+```
+
+```{r Libraries}
+libraries <- c('tidyverse', 'splines', 'rpart', 'rpart.plot', 'randomForest', 'gbm', 'caret', 'janitor', 'survey', 'irr')
+for (pkg in libraries){
+  library(pkg, character.only = TRUE)
+}
+```
+
+# Clean Up
+The COVID-19 Vaccination Module is available on the Combined Land Line and Cell Phone survey and versions 1-3 for states that conducted more than one version of the questionnaires. 
+```{r Importing Files}
+brfss <- read_csv("brfss.csv") %>% 
+  clean_names()
+brfssv1 <- read_csv("v1_2023.csv") %>% 
+  clean_names()
+brfssv2 <- read_csv("v2_2023.csv") %>% 
+  clean_names()
+brfssv3 <- read_csv("v3_2023.csv") %>% 
+  clean_names()
+```
+
+The following states had data on COVID-19 Vaccination status: 
+
+* Combined Land Line and Cell Phone data: Arkansas, Connecticut, Delaware, Georgia, Guam, Hawaii, Illinois, Michigan, Minnesota, Nebraska, New Hampshire, New Jersey, New Mexico, North Carolina, North Dakota, Puerto Rico, Vermont, Virginia, West Virginia, Wisconsin, Wyoming
+
+* Combined Land Line and Cell Phone data, version 1: Oklahoma
+
+* Combined Land Line and Cell Phone data, version 2: Maryland
+
+* Combined Land Line and Cell Phone data, version 3: Maryland
+```{r Subsetting and Combining States}
+# Subsetting and Combining States
+brfss_s <- brfss[brfss$state %in%
+c(5, 9, 10, 13, 66, 15, 17, 26, 27, 31, 33, 34, 35, 37, 38, 72, 50, 51, 54, 55, 56), ]
+brfss_s <- brfss_s %>% 
+  rename(finalwt = llcpwt) %>% 
+  rename(finalcpwt = cllcpwt)
+brfssv1_s <- brfssv1[brfssv1$state %in% c(40), ]
+brfssv1_s <- brfssv1_s %>% 
+  rename(finalwt=lcpwtv1) %>% 
+  rename(finalcpwt = clcwtv1)
+brfssv2_m <- brfssv2[brfssv2$state %in% c(24), ]
+brfssv2_m <- brfssv2_m %>% 
+  mutate(finalwt=lcpwtv2*0.50) %>% 
+  mutate(finalcpwt = clcwtv2*0.50) %>% 
+  subset(select=-c(lcpwtv2, clcwtv2))
+brfssv3_m <- brfssv3[brfssv3$state %in% c(24), ]
+brfssv3_m <- brfssv3_m %>% 
+  mutate(finalwt=lcpwtv3*0.50) %>% 
+  mutate(finalcpwt = clcwtv3*0.50) %>% 
+  subset(select=-c(lcpwtv3, clcwtv3))
+brfss_t <- rbind(brfss_s, brfssv1_s, brfssv2_m, brfssv3_m)
+```
+
+Only people who had COVID-19 are able to develop long COVID. 
+```{r Subsetting Covid Positives}
+# Subsetting Covid Positives
+brfss_c <- subset(brfss_t, covidpo1==1) 
+```
+
+
+```{r Cleaning and Creating Variables}
+# Long Covid - Defining missingness, factoring, creating level names
+brfss_c$covidsm1[brfss_c$covidsm1==7|brfss_c$covidsm1==9] <- NA
+brfss_c$covidsm1 <- factor(
+  ifelse(brfss_c$covidsm1==1, "Pos", "Neg")
+)
+brfss_c$covidsm1 <- relevel(brfss_c$covidsm1, ref="Pos")
+# Defining predictor missingness
+## Race
+brfss_c$race[brfss_c$race==9] <- NA
+
+## Education
+brfss_c$educag[brfss_c$educag==9] <- NA
+
+## Income
+brfss_c$incomg1[brfss_c$incomg1==9] <- NA
+
+## Insurance Status
+brfss_c$hlthpl1[brfss_c$hlthpl1==9] <- NA
+
+## Smoking
+brfss_c$smoker3[brfss_c$smoker3==9] <- NA
+
+# Factoring Predictors
+variable <- c("age_g", "sexvar", "race", "educag", "incomg1", "hlthpl1", "smoker3")
+for (var in variable) {
+brfss_c[[var]] <- factor(brfss_c[[var]])
+}
+
+# BMI - Creating a continuous BMI variable, removing outliers
+brfss_c$wt <- brfss_c$wtkg3/100
+brfss_c$ht <- brfss_c$htm4/100
+brfss_c$bmi <- brfss_c$wt/brfss_c$ht^2
+iqr <- IQR(brfss_c$bmi, na.rm = TRUE)
+qnt <- quantile(brfss_c$bmi, probs=c(.25, .75), na.rm = TRUE)
+lower <- qnt[1] - 1.5*iqr
+upper <- qnt[2] + 1.5*iqr
+brfss_c <- brfss_c %>% 
+  subset(brfss_c$bmi>lower & brfss_c$bmi<upper)
+
+# Mental Health - Defining missingness and 0
+brfss_c$menthlth[brfss_c$menthlth==77|brfss_c$menthlth==99] <- NA
+brfss_c$menthlth[brfss_c$menthlth ==88] <- 0
+
+# COVID-19 Vaccine Status - Creating a factor vaccine variable starting with 0
+brfss_c$cvax <-factor(
+  ifelse(brfss_c$covidva1==2,0, 
+                       ifelse(brfss_c$covidnu2==1,1,
+                              ifelse(brfss_c$covidnu2==2,2,
+                                     ifelse(brfss_c$covidnu2==3,3,
+                                            ifelse(brfss_c$covidnu2==4,4,
+                                                   ifelse(brfss_c$covidnu2==5,5, NA))))))
+)
+```
+
+```{r Addressing Missingness}
+# Complete Case Analysis
+brfss_c <- na.omit(brfss_c[, c("age_g", "sexvar", "race", "educag", "incomg1", "hlthpl1", "smoker3", "bmi", "menthlth", "cvax", "covidsm1")])
+```
+
+There are 6,942 participants with long COVID and 46,886 without. I am creating class weights to address the imbalance. 
+```{r Calculating Class Weights}
+class_counts <- table(brfss_c$covidsm1)
+total_samples <- sum(class_counts)
+num_classes <- length(class_counts)
+class_weight <- total_samples / (num_classes * class_counts)
+class_weight
+brfss_c$classwt <- ifelse(brfss_c$covidsm1=="Pos", class_weight["Pos"], class_weight["Neg"])
+```
+
+# Machine Learning Models
+```{r Logistic Regression}
+# Logistic Regression
+set.seed(1234)
+lc_log <- train(covidsm1 ~ age_g + sexvar + race + educag + incomg1 + hlthpl1 + smoker3 + bmi + menthlth + cvax, 
+      data = brfss_c,
+      method = "glm", 
+      family = binomial(link = "logit"), 
+      trControl = trainControl(method = "cv", 
+                               number = 10, 
+                               classProbs = TRUE, 
+                               savePredictions = TRUE),
+      weights = brfss_c$classwt)
+# Deriving Sensitivity, Specificity, Accuracy, Kappa
+confusionMatrix(lc_log$pred$pred, lc_log$pred$obs)
+# Deriving Variable Importance
+lc_log_vi <- varImp(lc_log$finalModel)
+lc_log_vi[order(-lc_log_vi$Overall), , drop = FALSE]
+# Seeing Model Coefficients and Odds Ratios
+exp(coef(lc_log$finalModel))
+summary(lc_log$finalModel)
+```
+
+
+```{r Naive Bayes}
+# Naive Bayes
+set.seed(1234)
+lc_naive <- train(covidsm1 ~ age_g + sexvar + race + educag + incomg1 + hlthpl1 + smoker3 + bmi + menthlth + cvax, 
+      data = brfss_c,
+      method = "naive_bayes",
+      tuneGrid = data.frame(laplace = 0, 
+                            usekernel = FALSE, 
+                            adjust = FALSE),
+      trControl = trainControl(method = "cv", 
+                               number = 10, 
+                               classProbs = TRUE, 
+                               savePredictions = TRUE),
+      weights = brfss_c$classwt)
+# Deriving Sensitivity, Specificity, Accuracy, Kappa
+confusionMatrix(lc_naive$pred$pred, lc_naive$pred$obs)
+# Naive Bayes is incompatible with varImp()
+```
+
+
+```{r Classification Tree}
+# Setting up cp tuning grid
+set.seed(1234)
+lc_tree_cp <- rpart(covidsm1 ~ age_g + sexvar + race + educag + incomg1 + hlthpl1 + smoker3 + bmi + menthlth + cvax,
+                    data = brfss_c,
+                    method = "class",
+                    parms = list(split = "gini"),
+                    control = rpart.control(minsplit = 30, minbucket = 10), cp = 0,
+                    weights = brfss_c$classwt)
+tg_lc <- data.frame(cp = lc_tree_cp$cptable[,1]) 
+# Classification Tree 
+set.seed(1234)
+lc_tree <- train(covidsm1 ~ age_g + sexvar + race + educag + incomg1 + hlthpl1 + smoker3 + bmi + menthlth + cvax,
+                 data = brfss_c,
+                 method = "rpart",
+                 parms = list(split = "gini"),
+                 control = rpart.control(minsplit = 30, minbucket = 10), 
+                 tuneGrid = tg_lc,
+                 trControl = trainControl(method = "cv",
+                                          number = 10,
+                                          selectionFunction = "oneSE",
+                                          classProbs = TRUE,
+                                          savePredictions = TRUE),
+                 weights = brfss_c$classwt)
+lc_tree
+rpart.plot(lc_tree$finalModel)
+# Deriving Sensitivity, Specificity, Accuracy, Kappa
+confusionMatrix(lc_tree$pred$pred, lc_tree$pred$obs)
+# Deriving Variable Importance
+lc_tree_vi <- varImp(lc_tree$finalModel)
+lc_tree_vi[order(-lc_tree_vi$Overall), , drop = FALSE]
+```
+
+
+```{r Random Forest}
+# Random Forest
+set.seed(1234)
+lc_rf <-randomForest(covidsm1 ~ age_g + sexvar + race + educag + incomg1 + hlthpl1 + smoker3 + bmi + menthlth + cvax,
+                     data=brfss_c,
+                     classwt=class_weight,
+                     importance=TRUE)
+lc_rf
+# Since the OOB Error Rate does appear to flatten, 500 trees is sufficient
+plot(lc_rf$err.rate[, 1], col = "maroon", xlab = "Number of Trees", ylab = "OOB Error Rate")
+# Calculating Kappa
+oob_predictions <- lc_rf$votes
+oob_predicted_classes <- factor(
+  ifelse(oob_predictions[, 1] > 0.5, "Pos", "Neg")
+)
+oob_predicted_classes <- relevel(oob_predicted_classes, ref="Pos")
+actual_classes <- brfss_c$covidsm1
+conf_matrix <- table(Predicted = oob_predicted_classes, Actual = actual_classes)
+kappa(conf_matrix)
+#Deriving Variable Importance
+lc_rf_vi <- varImp(lc_rf)
+lc_rf_vi[order(-lc_rf_vi$Neg), , drop = FALSE]
+varImpPlot(lc_rf, main="Variable Importance")
+```
+
+
+```{r results='hide'}
+# Setting up tuning grid
+tg_boostclass <- expand.grid(n.trees = c(5, 10, 15, 20, 25, 30, 35, 40, 45, 50),
+                             interaction.depth = 1:6, 
+                             shrinkage = c(0.2, 0.25, 0.3, 0.35, 0.4, 0.45), 
+                             n.minobsinnode = 10)
+# Boosted Tree
+set.seed(1234)
+lc_boost <- train(covidsm1 ~ age_g + sexvar + race + educag + incomg1 + hlthpl1 + smoker3 + bmi + menthlth + cvax,
+               data = brfss_c,
+               method = "gbm", 
+               bag.fraction = 0.5, 
+               tuneGrid = tg_boostclass,
+               trControl = trainControl(method = "cv", 
+                                        number = 10, 
+                                        classProbs = TRUE,
+                                        savePredictions = TRUE),
+               weights = brfss_c$classwt)
+```
+
+
+```{r Boosted Tree}
+# Deriving Sensitivity, Specificity, Accuracy, Kappa
+confusionMatrix(lc_boost$pred$pred, lc_boost$pred$obs)
+# Deriving Variable Importance
+lc_boost_vi <- varImp(lc_boost$finalModel)
+lc_boost_vi[order(-lc_boost_vi$Overall), , drop = FALSE]
+summary(lc_boost$finalModel, 
+        method = relative.influence, 
+        normalize = TRUE,
+        las = 2, 
+        order=TRUE, 
+        cBars=5)
+plot(lc_boost$finalModel, i = "menthlth")
+plot(lc_boost$finalModel, i = "educag4")
+plot(lc_boost$finalModel, i = "sexvar2")
+```
